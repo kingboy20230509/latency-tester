@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 网络延迟测试工具 (纯 Bash 版)
-# 依赖: curl, getent (glibc 自带), 无需 root, 无需额外安装
+# 依赖: getent (glibc 自带), bash 内置 /dev/tcp，无需 curl，无需 root，无需额外安装
+# 使用纯 TCP 连接测延迟，不依赖 HTTPS/TLS，因此对 Telegram 等非标准协议服务器也能准确测试
 #
 # 用法:
 #   ./latency_test.sh
@@ -57,19 +58,18 @@ resolve_ip() {
 
 tcp_ping_once() {
   local domain="$1" ip="$2" port="$3" timeout="$4"
-  local t
-  # 用 --resolve 把域名强制解析到指定IP，但保持 Host/SNI 为域名本身，
-  # 这样既能验证服务器证书（避免 "IP直连导致证书不匹配"被误判为超时），
-  # 又能准确测试到这个具体IP的连接延迟。
-  t=$(curl -s -o /dev/null --connect-timeout "$timeout" \
-        --resolve "${domain}:${port}:${ip}" \
-        -w '%{time_connect}' \
-        "https://${domain}:${port}/" 2>/dev/null)
-  if [[ -z "$t" || "$t" == "0.000000" ]]; then
+  # 用 bash 自带的 /dev/tcp 做纯 TCP 三次握手测试，不依赖 TLS/HTTPS。
+  # 这样无论目标是普通网站、还是像 Telegram DC 那种走自定义协议的服务器，
+  # 只要 TCP 端口能连通就能测出延迟，不会因协议不匹配被误判为超时。
+  local start end elapsed_ms
+  start=$(date +%s%N)
+  if timeout "$timeout" bash -c "exec 3<>/dev/tcp/${ip}/${port}" 2>/dev/null; then
+    end=$(date +%s%N)
+    elapsed_ms=$(( (end - start) / 1000000 ))
+    echo "$elapsed_ms"
+  else
     echo ""
-    return
   fi
-  awk -v t="$t" 'BEGIN{printf "%.1f", t*1000}'
 }
 
 test_target() {
