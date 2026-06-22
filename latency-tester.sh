@@ -56,11 +56,15 @@ resolve_ip() {
 }
 
 tcp_ping_once() {
-  local ip="$1" port="$2" timeout="$3"
+  local domain="$1" ip="$2" port="$3" timeout="$4"
   local t
+  # 用 --resolve 把域名强制解析到指定IP，但保持 Host/SNI 为域名本身，
+  # 这样既能验证服务器证书（避免 "IP直连导致证书不匹配"被误判为超时），
+  # 又能准确测试到这个具体IP的连接延迟。
   t=$(curl -s -o /dev/null --connect-timeout "$timeout" \
+        --resolve "${domain}:${port}:${ip}" \
         -w '%{time_connect}' \
-        "https://${ip}:${port}/" 2>/dev/null)
+        "https://${domain}:${port}/" 2>/dev/null)
   if [[ -z "$t" || "$t" == "0.000000" ]]; then
     echo ""
     return
@@ -78,7 +82,7 @@ test_target() {
   for ((i=0; i<COUNT; i++)); do
     if [[ -n "$ip" ]]; then
       local ms
-      ms=$(tcp_ping_once "$ip" "$port" "$TIMEOUT")
+      ms=$(tcp_ping_once "$domain" "$ip" "$port" "$TIMEOUT")
       if [[ -n "$ms" ]]; then
         success=$((success+1))
         sum=$(awk -v s="$sum" -v m="$ms" 'BEGIN{printf "%.1f", s+m}')
