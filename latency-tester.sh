@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
-# 网络延迟测试工具 (纯 Bash 版 - 精确模式)
+# 网络延迟测试工具 (纯 Bash 版 - 真实体感模式)
 #
-# 设计目标: 尽量减少"测量方法本身"带来的误差，得到更接近真实网络延迟的结果。
+# 设计目标: 测的是"你真实访问一个网站时，从发起请求到拿到完整响应"的总耗时，
+# 而不是 ping 那种只测网络层往返的"理论值"。这更贴近你用服务器实际访问/
+# 调用这些服务时能感知到的延迟。
 #
-# 关键改动 (相比上一版):
-#   1. 优先使用系统自带的 ping (ICMP)。ping 的时间戳是内核态打的，
-#      几乎不受用户态进程调度/CPU抢占影响，比"应用层模拟TCP连接"准确得多。
-#   2. 默认串行执行 (一个测完再测下一个)，避免19个目标同时起进程互相抢CPU，
-#      导致延迟被"调度排队时间"拉高、结果失真。
-#   3. 每个目标测 N 次取中位数 (而不是平均数)，过滤掉偶发的抖动尖刺。
-#   4. 如果 ping 被防火墙/ICMP限制屏蔽 (无法连通)，自动回退到 TCP 连接测试
-#      (用 /dev/tcp)，保证目标仍然能测出一个延迟参考值。
+# 用 curl 发起真实 HTTPS 请求，拆分各阶段耗时:
+#   DNS解析 -> TCP连接 -> TLS握手 -> 首字节(TTFB) -> 总耗时
+# 表格主指标用 time_total (总耗时)，这是最接近"点一下要等多久"的体感数字。
 #
-# 依赖: ping (iputils, 大多数 Linux 默认自带), getent, bash 内置 /dev/tcp
-# 无需 root，无需 curl
+# 默认串行执行 + 多次采样取中位数，避免并发抢CPU导致结果失真。
+#
+# 依赖: curl (绝大多数 Linux 默认自带，如未安装: apt install curl)
 #
 # 用法:
-#   ./latency_test.sh                # 默认: 每个目标 ping 5 次，串行
+#   ./latency_test.sh                # 默认: 每个目标测 5 次，串行
 #   ./latency_test.sh -c 8            # 每个目标测 8 次
-#   ./latency_test.sh -t 2            # 单次超时秒数
+#   ./latency_test.sh -t 5            # 单次超时秒数(默认5，HTTPS比ping慢，超时要给够)
 #   ./latency_test.sh -p 4            # 允许4个并发 (默认1=串行，更准但更慢)
 
 set -uo pipefail
 
 COUNT=5
-TIMEOUT=2
+TIMEOUT=5
 PARALLEL=1
 
 while getopts "c:t:p:" opt; do
@@ -36,7 +34,13 @@ while getopts "c:t:p:" opt; do
   esac
 done
 
-# 目标列表: "显示名称|域名|端口"
+if ! command -v curl >/dev/null 2>&1; then
+  echo "错误: 未检测到 curl，请先安装: apt install -y curl"
+  exit 1
+fi
+
+# 目标列表: "显示名称|域名|端口"  (Telegram 走的是 MTProto 协议而非 HTTPS，
+# curl 无法正常请求，这里换成一个真实支持 HTTPS 的 Telegram 域名)
 TARGETS=(
   "X|x.com|443"
   "Apple|apple.com|443"
@@ -56,113 +60,67 @@ TARGETS=(
   "Netflix|fast.com|443"
   "GitHub|github.com|443"
   "NodeSeek|nodeseek.com|443"
-  "Telegram|149.154.167.50|443"
+  "Telegram|web.telegram.org|443"
 )
 
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE" "${TMPFILE}.final"' EXIT
 
-HAS_PING=0
-if command -v ping >/dev/null 2>&1; then
-  HAS_PING=1
-fi
-
 resolve_ip() {
   local domain="$1"
-  if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$domain"
-    return
-  fi
   getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}'
 }
 
-# 用 ICMP ping 测试，返回 "avg_ms|loss_pct"，失败则 avg_ms 为空
-icmp_ping_test() {
-  local ip="$1" count="$2" timeout="$3"
+# 用 curl 发一次真实 HTTPS 请求，返回 "总耗时ms|TTFB毫秒"，失败返回空
+https_request_once() {
+  local domain="$1" timeout="$2"
   local out
-  out=$(ping -c "$count" -W "$timeout" -i 0.3 "$ip" 2>/dev/null)
+  out=$(curl -s -o /dev/null --connect-timeout "$timeout" --max-time "$timeout" \
+        -w '%{time_total} %{time_starttransfer}' \
+        "https://${domain}/" 2>/dev/null)
   if [[ -z "$out" ]]; then
-    echo "|100"
+    echo ""
     return
   fi
-  local avg loss
-  avg=$(echo "$out" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+' | sed 's/^= //' | awk -F'/' '{print $2}')
-  loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)
-  [[ -z "$loss" ]] && loss=100
-  echo "${avg}|${loss}"
-}
-
-# 用纯 TCP 连接做单次测试 (ping 不可用/被墙时的备用方案)
-tcp_ping_once() {
-  local ip="$1" port="$2" timeout="$3"
-  local start end elapsed_ms
-  start=$(date +%s%N)
-  if timeout "$timeout" bash -c "exec 3<>/dev/tcp/${ip}/${port}" 2>/dev/null; then
-    end=$(date +%s%N)
-    elapsed_ms=$(( (end - start) / 1000000 ))
-    echo "$elapsed_ms"
-  else
+  local total ttfb
+  total=$(echo "$out" | awk '{print $1}')
+  ttfb=$(echo "$out" | awk '{print $2}')
+  if [[ -z "$total" || "$total" == "0.000000" ]]; then
     echo ""
+    return
   fi
+  # 转成毫秒
+  awk -v t="$total" 'BEGIN{printf "%.1f", t*1000}'
 }
 
-tcp_fallback_test() {
-  local ip="$1" port="$2" count="$3" timeout="$4"
+test_target() {
+  local name="$1" domain="$2" port="$3"
+  local ip
+  ip=$(resolve_ip "$domain")
+
   local success=0
   local samples=()
-  for ((i=0; i<count; i++)); do
+  for ((i=0; i<COUNT; i++)); do
     local ms
-    ms=$(tcp_ping_once "$ip" "$port" "$timeout")
+    ms=$(https_request_once "$domain" "$TIMEOUT")
     if [[ -n "$ms" ]]; then
       success=$((success+1))
       samples+=("$ms")
     fi
   done
-  local loss
-  loss=$(awk -v c="$count" -v s="$success" 'BEGIN{printf "%.0f", (c-s)/c*100}')
+
+  local loss median
+  loss=$(awk -v c="$COUNT" -v s="$success" 'BEGIN{printf "%.0f", (c-s)/c*100}')
   if (( success == 0 )); then
-    echo "|100"
-    return
-  fi
-  # 取中位数
-  local sorted median
-  sorted=$(printf '%s\n' "${samples[@]}" | sort -n)
-  median=$(echo "$sorted" | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-  echo "${median}|${loss}"
-}
-
-test_target() {
-  local name="$1" domain="$2" port="$3"
-  local ip ver
-  ip=$(resolve_ip "$domain")
-  if [[ -n "$ip" ]]; then ver="IPv4"; else ver="N/A"; fi
-
-  local result avg loss method=""
-  if [[ -z "$ip" ]]; then
-    avg=""; loss=100
-  elif (( HAS_PING )); then
-    result=$(icmp_ping_test "$ip" "$COUNT" "$TIMEOUT")
-    avg="${result%%|*}"
-    loss="${result##*|}"
-    method="ICMP"
-    # 如果 ping 完全不通 (可能被防火墙拦截ICMP), 自动回退到TCP
-    if [[ -z "$avg" || "$loss" == "100" ]]; then
-      result=$(tcp_fallback_test "$ip" "$port" "$COUNT" "$TIMEOUT")
-      avg="${result%%|*}"
-      loss="${result##*|}"
-      method="TCP"
-    fi
+    median=""
   else
-    result=$(tcp_fallback_test "$ip" "$port" "$COUNT" "$TIMEOUT")
-    avg="${result%%|*}"
-    loss="${result##*|}"
-    method="TCP"
+    median=$(printf '%s\n' "${samples[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
   fi
 
-  echo "${name}|${domain}|${ip:-解析失败}|${ver}|${avg}|${loss}|${method}" >> "$TMPFILE"
+  echo "${name}|${domain}|${ip:-解析失败}|${median}|${loss}" >> "$TMPFILE"
 }
 
-echo "🚀 开始延迟测试 (串行=更准确，并发数=${PARALLEL})..."
+echo "🚀 开始延迟测试 (真实HTTPS请求耗时，串行=更准确，并发数=${PARALLEL})..."
 START=$(date +%s)
 
 if (( PARALLEL <= 1 )); then
@@ -193,11 +151,11 @@ status_for() {
     echo "✗ 超时"
   elif (( loss > 50 )); then
     echo "✗ 异常"
-  elif awk -v l="$latency" 'BEGIN{exit !(l<50)}'; then
-    echo "✓ 优秀"
-  elif awk -v l="$latency" 'BEGIN{exit !(l<100)}'; then
-    echo "◆ 良好"
   elif awk -v l="$latency" 'BEGIN{exit !(l<200)}'; then
+    echo "✓ 优秀"
+  elif awk -v l="$latency" 'BEGIN{exit !(l<500)}'; then
+    echo "◆ 良好"
+  elif awk -v l="$latency" 'BEGIN{exit !(l<1000)}'; then
     echo "▲ 较差"
   else
     echo "✗ 异常"
@@ -205,18 +163,18 @@ status_for() {
 }
 
 echo "📊 测试完成！ 总时间: ${ELAPSED}秒"
-echo "📋 延迟测试结果表格:"
-WIDTH=105
+echo "📋 真实HTTPS访问耗时表格 (含DNS+TCP+TLS+首字节，更贴近真实体感):"
+WIDTH=95
 printf '%s\n' "$(printf '═%.0s' $(seq 1 $WIDTH))"
-printf "%-4s %-14s %-28s %8s %6s %-8s %-16s %-6s %-5s\n" "排名" "服务" "域名" "延迟" "丢包率" "状态" "IPv4地址" "版本" "方式"
+printf "%-4s %-14s %-28s %10s %6s %-8s %-16s\n" "排名" "服务" "域名" "总耗时" "丢包率" "状态" "IPv4地址"
 printf '%s\n' "$(printf '═%.0s' $(seq 1 $WIDTH))"
 
-awk -F'|' '{ if ($5=="") print 999999"|"$0; else print $5"|"$0 }' "$TMPFILE" \
+awk -F'|' '{ if ($4=="") print 999999"|"$0; else print $4"|"$0 }' "$TMPFILE" \
   | sort -t'|' -k1,1n \
   | cut -d'|' -f2- > "${TMPFILE}.final"
 
 rank=0
-while IFS='|' read -r name domain ip ver latency loss method; do
+while IFS='|' read -r name domain ip latency loss; do
   rank=$((rank+1))
   if [[ -n "$latency" ]]; then
     latency_str="${latency}ms"
@@ -224,12 +182,10 @@ while IFS='|' read -r name domain ip ver latency loss method; do
     latency_str="超时"
   fi
   status=$(status_for "$latency" "$loss")
-  printf "%-4s %-14s %-28s %8s %5s%% %-8s %-16s %-6s %-5s\n" \
-    "$rank" "$name" "$domain" "$latency_str" "$loss" "$status" "$ip" "$ver" "$method"
+  printf "%-4s %-14s %-28s %10s %5s%% %-8s %-16s\n" \
+    "$rank" "$name" "$domain" "$latency_str" "$loss" "$status" "$ip"
 done < "${TMPFILE}.final"
 
 printf '%s\n' "$(printf '═%.0s' $(seq 1 $WIDTH))"
-
-if (( ! HAS_PING )); then
-  echo "提示: 本机未检测到 ping 命令，全部使用 TCP 连接方式测试。"
-fi
+echo "说明: 此处的耗时包含 DNS解析+TCP连接+TLS握手+服务器响应首字节 的完整过程，"
+echo "      代表真实发起一次HTTPS请求到收到响应所需的时间，比单纯ping更贴近实际体感。"
