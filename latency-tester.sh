@@ -86,9 +86,7 @@ icmp_ping_test() {
     return
   fi
   local avg loss
-  avg=$(echo "$out" | grep -oP '(?<=/)([0-9.]+)(?=/[0-9.]+/[0-9.]+\s*ms)' | head -1)
-  # 上面的提取方式依赖 rtt min/avg/max/mdev 格式，取第二个数字(avg)
-  avg=$(echo "$out" | grep -oE 'rtt [^=]*= [0-9.]+/[0-9.]+/[0-9.]+' | awk -F'/' '{print $2}')
+  avg=$(echo "$out" | grep -oE '= [0-9.]+/[0-9.]+/[0-9.]+' | sed 's/^= //' | awk -F'/' '{print $2}')
   loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)
   [[ -z "$loss" ]] && loss=100
   echo "${avg}|${loss}"
